@@ -91,8 +91,9 @@ def score_to_signal(score: int) -> str:
 
 def analyze_ticker(ticker: str) -> dict:
     time.sleep(0.3)  # small delay to avoid rate limiting
+    yf.set_tz_cache_location("cache")
     stock = yf.Ticker(ticker, session=session)
-    df = stock.history(period="6mo")
+    df = yf.download(ticker, period="6mo", progress=False, auto_adjust=True)
 
     if df is None or df.empty:
         # Try shorter period as fallback
