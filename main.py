@@ -1,34 +1,24 @@
 """
 ParmStockAdvisor — FastAPI Backend
-Fetches real-time data from Yahoo Finance using yfinance + pandas/numpy.
+Fetches real-time data from Alpha Vantage API using pandas/numpy.
 
 Run locally:
     pip install -r requirements.txt
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-
-Deploy to Railway/Render:
-    Just push this folder — they auto-detect the requirements.txt
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
-import yfinance as yf
 import pandas as pd
 import numpy as np
-import json
-import time
 import requests
+import time
 
-# Session with browser-like headers to avoid Yahoo Finance blocks
-session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5',
-    'Accept-Encoding': 'gzip, deflate, br',
-})
+# ─── Alpha Vantage Config ─────────────────────────────────────────────────────
+AV_API_KEY = "VPSD9C69IC5OBOW7"
+AV_BASE    = "https://www.alphavantage.co/query"
 
 app = FastAPI(title="ParmStockAdvisor API", version="2.0.0")
 
@@ -39,6 +29,59 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ─── Alpha Vantage Data Fetcher ───────────────────────────────────────────────
+
+def fetch_daily(ticker: str) -> pd.DataFrame:
+    """Fetch daily OHLCV data from Alpha Vantage."""
+    params = {
+        "function":   "TIME_SERIES_DAILY",
+        "symbol":     ticker,
+        "outputsize": "compact",  # last 100 data points
+        "apikey":     AV_API_KEY,
+    }
+    r = requests.get(AV_BASE, params=params, timeout=15)
+    data = r.json()
+
+    if "Time Series (Daily)" not in data:
+        msg = data.get("Note") or data.get("Information") or data.get("Error Message") or "No data"
+        raise ValueError(f"Alpha Vantage error for '{ticker}': {msg}")
+
+    ts = data["Time Series (Daily)"]
+    rows = []
+    for date, vals in ts.items():
+        rows.append({
+            "Date":   pd.to_datetime(date),
+            "Open":   float(vals["1. open"]),
+            "High":   float(vals["2. high"]),
+            "Low":    float(vals["3. low"]),
+            "Close":  float(vals["4. close"]),
+            "Volume": float(vals["5. volume"]),
+        })
+    df = pd.DataFrame(rows).sort_values("Date").reset_index(drop=True)
+    return df
+
+def fetch_quote(ticker: str) -> dict:
+    """Fetch current quote from Alpha Vantage."""
+    params = {
+        "function": "GLOBAL_QUOTE",
+        "symbol":   ticker,
+        "apikey":   AV_API_KEY,
+    }
+    r = requests.get(AV_BASE, params=params, timeout=15)
+    data = r.json()
+    quote = data.get("Global Quote", {})
+    return quote
+
+def fetch_overview(ticker: str) -> dict:
+    """Fetch company overview from Alpha Vantage."""
+    params = {
+        "function": "OVERVIEW",
+        "symbol":   ticker,
+        "apikey":   AV_API_KEY,
+    }
+    r = requests.get(AV_BASE, params=params, timeout=15)
+    return r.json()
 
 # ─── Technical Analysis ───────────────────────────────────────────────────────
 
@@ -75,9 +118,9 @@ def compute_bollinger(series: pd.Series, period: int = 20):
     upper = sma + 2 * std
     lower = sma - 2 * std
     return {
-        "upper": round(float(upper.iloc[-1]), 2),
+        "upper":  round(float(upper.iloc[-1]), 2),
         "middle": round(float(sma.iloc[-1]), 2),
-        "lower": round(float(lower.iloc[-1]), 2),
+        "lower":  round(float(lower.iloc[-1]), 2),
     }
 
 def score_to_signal(score: int) -> str:
@@ -90,14 +133,7 @@ def score_to_signal(score: int) -> str:
     return "STRONG SELL"
 
 def analyze_ticker(ticker: str) -> dict:
-    time.sleep(0.3)  # small delay to avoid rate limiting
-    yf.set_tz_cache_location("cache")
-    stock = yf.Ticker(ticker, session=session)
-    df = yf.download(ticker, period="6mo", progress=False, auto_adjust=True)
-
-    if df is None or df.empty:
-        # Try shorter period as fallback
-        df = stock.history(period="1mo")
+    df = fetch_daily(ticker)
 
     if df is None or df.empty:
         raise ValueError(f"No data found for '{ticker}'")
@@ -105,22 +141,22 @@ def analyze_ticker(ticker: str) -> dict:
     close  = df["Close"]
     volume = df["Volume"]
 
-    sma20  = close.rolling(20).mean()
-    sma50  = close.rolling(50).mean()
+    sma20 = close.rolling(20).mean()
+    sma50 = close.rolling(50).mean()
 
-    price  = round(float(close.iloc[-1]), 2)
-    prev   = round(float(close.iloc[-2]), 2)
-    chg    = round((price - prev) / prev * 100, 2)
-    s20    = round(float(sma20.iloc[-1]), 2)
-    s50    = round(float(sma50.iloc[-1]), 2) if not pd.isna(sma50.iloc[-1]) else s20
+    price = round(float(close.iloc[-1]), 2)
+    prev  = round(float(close.iloc[-2]), 2)
+    chg   = round((price - prev) / prev * 100, 2)
+    s20   = round(float(sma20.iloc[-1]), 2)
+    s50   = round(float(sma50.iloc[-1]), 2) if not pd.isna(sma50.iloc[-1]) else s20
 
-    rsi              = compute_rsi(close)
+    rsi                      = compute_rsi(close)
     macd, macd_sig, macd_hist = compute_macd(close)
-    trend            = compute_trend(close)
-    bb               = compute_bollinger(close)
+    trend                    = compute_trend(close)
+    bb                       = compute_bollinger(close)
 
-    avg_vol  = float(volume.tail(20).mean())
-    last_vol = float(volume.iloc[-1])
+    avg_vol   = float(volume.tail(20).mean())
+    last_vol  = float(volume.iloc[-1])
     vol_ratio = round(last_vol / avg_vol, 2) if avg_vol > 0 else 1.0
 
     # ── Scoring ──────────────────────────────────────────────────────────────
@@ -171,14 +207,14 @@ def analyze_ticker(ticker: str) -> dict:
 
     # Company info
     try:
-        info = stock.info
-        name = info.get("longName") or info.get("shortName") or ticker.upper()
-        sector   = info.get("sector", "")
-        industry = info.get("industry", "")
-        market_cap = info.get("marketCap", None)
-        pe_ratio   = info.get("trailingPE", None)
-        week52_high = info.get("fiftyTwoWeekHigh", None)
-        week52_low  = info.get("fiftyTwoWeekLow", None)
+        overview = fetch_overview(ticker)
+        name       = overview.get("Name", ticker.upper())
+        sector     = overview.get("Sector", "")
+        industry   = overview.get("Industry", "")
+        market_cap = float(overview["MarketCapitalization"]) if overview.get("MarketCapitalization") else None
+        pe_ratio   = float(overview["PERatio"]) if overview.get("PERatio") and overview["PERatio"] != "None" else None
+        week52_high = float(overview["52WeekHigh"]) if overview.get("52WeekHigh") else None
+        week52_low  = float(overview["52WeekLow"]) if overview.get("52WeekLow") else None
     except Exception:
         name = ticker.upper()
         sector = industry = ""
@@ -201,9 +237,9 @@ def analyze_ticker(ticker: str) -> dict:
         "bb":           bb,
         "volRatio":     vol_ratio,
         "marketCap":    market_cap,
-        "peRatio":      round(float(pe_ratio), 2) if pe_ratio else None,
-        "week52High":   round(float(week52_high), 2) if week52_high else None,
-        "week52Low":    round(float(week52_low), 2) if week52_low else None,
+        "peRatio":      round(pe_ratio, 2) if pe_ratio else None,
+        "week52High":   round(week52_high, 2) if week52_high else None,
+        "week52Low":    round(week52_low, 2) if week52_low else None,
         "score":        score,
         "signal":       score_to_signal(score),
         "priceHistory": hist40,
@@ -242,9 +278,10 @@ def analyze_many(tickers: str):
     ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     results = []
     errors  = []
-    for t in ticker_list[:20]:  # max 20 at once
+    for t in ticker_list[:20]:
         try:
             results.append(analyze_ticker(t))
+            time.sleep(0.5)  # respect Alpha Vantage rate limit
         except Exception as e:
             errors.append({"ticker": t, "error": str(e)})
     return {"results": results, "errors": errors}
@@ -254,7 +291,7 @@ def get_sectors():
     """Return all predefined sector watchlists."""
     return {
         "Technology":  ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "AMD", "INTC", "ORCL"],
-        "Finance":     ["JPM", "BAC", "GS", "MS", "WFC", "BRK-B", "C", "AXP", "BLK", "V"],
+        "Finance":     ["JPM", "BAC", "GS", "MS", "WFC", "C", "AXP", "BLK", "V"],
         "Healthcare":  ["JNJ", "PFE", "ABBV", "MRK", "UNH", "LLY", "TMO", "ABT", "BMY", "AMGN"],
         "Energy":      ["XOM", "CVX", "COP", "EOG", "SLB", "OXY", "MPC", "PSX", "VLO", "HAL"],
         "Consumer":    ["WMT", "COST", "TGT", "MCD", "SBUX", "NKE", "HD", "LOW", "TJX"],
@@ -263,15 +300,18 @@ def get_sectors():
 
 @app.get("/quote/{ticker}")
 def quick_quote(ticker: str):
-    """Fast price-only quote — no heavy TA computation."""
+    """Fast price-only quote."""
     try:
-        stock = yf.Ticker(ticker.upper(), session=session)
-        info  = stock.fast_info
+        quote = fetch_quote(ticker.upper())
+        if not quote or "05. price" not in quote:
+            raise ValueError("No quote data")
+        price = float(quote["05. price"])
+        prev  = float(quote["08. previous close"])
         return {
-            "ticker": ticker.upper(),
-            "price":  round(float(info.last_price), 2),
-            "change": round(float(info.last_price - info.previous_close), 2),
-            "changePct": round((info.last_price - info.previous_close) / info.previous_close * 100, 2),
+            "ticker":    ticker.upper(),
+            "price":     round(price, 2),
+            "change":    round(price - prev, 2),
+            "changePct": round((price - prev) / prev * 100, 2),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
