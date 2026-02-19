@@ -15,7 +15,8 @@ import requests
 
 # ─── Financial Modeling Prep Config ──────────────────────────────────────────
 FMP_API_KEY = "BDUFyoYbfR6jCYehbHXlT53Y7D8PIfur"
-FMP_BASE    = "https://financialmodelingprep.com/api/v3"
+FMP_V3_BASE = "https://financialmodelingprep.com/api/v3"
+FMP_V4_BASE = "https://financialmodelingprep.com/api/v4"
 
 app = FastAPI(title="ParmStockAdvisor API", version="2.0.0")
 
@@ -29,7 +30,10 @@ app.add_middleware(
 # ─── Data Fetchers ───────────────────────────────────────────────────────────
 
 def fetch_daily(ticker: str) -> pd.DataFrame:
-    url = f"{FMP_BASE}/historical-price-full/{ticker}?timeseries=120&apikey={FMP_API_KEY}"
+    """
+    Fetch daily OHLCV data from FMP v4 (non-legacy endpoint).
+    """
+    url = f"{FMP_V4_BASE}/historical-price-full/{ticker}?apikey={FMP_API_KEY}"
     r = requests.get(url, timeout=15)
     data = r.json()
 
@@ -37,7 +41,7 @@ def fetch_daily(ticker: str) -> pd.DataFrame:
         raise ValueError(f"FMP error for '{ticker}': {data}")
 
     rows = []
-    for item in data["historical"]:
+    for item in data["historical"][:150]:
         rows.append({
             "Date":   pd.to_datetime(item["date"]),
             "Open":   float(item["open"]),
@@ -52,24 +56,20 @@ def fetch_daily(ticker: str) -> pd.DataFrame:
 
 
 def fetch_quote(ticker: str) -> dict:
-    url = f"{FMP_BASE}/quote/{ticker}?apikey={FMP_API_KEY}"
+    url = f"{FMP_V3_BASE}/quote/{ticker}?apikey={FMP_API_KEY}"
     r = requests.get(url, timeout=15)
     data = r.json()
-    if not data:
-        return {}
-    return data[0]
+    return data[0] if data else {}
 
 
 def fetch_overview(ticker: str) -> dict:
-    url = f"{FMP_BASE}/profile/{ticker}?apikey={FMP_API_KEY}"
+    url = f"{FMP_V3_BASE}/profile/{ticker}?apikey={FMP_API_KEY}"
     r = requests.get(url, timeout=15)
     data = r.json()
-    if not data:
-        return {}
-    return data[0]
+    return data[0] if data else {}
 
 
-# ─── Technical Analysis ───────────────────────────────────────────────────────
+# ─── Technical Indicators ────────────────────────────────────────────────────
 
 def compute_rsi(series: pd.Series, period: int = 14) -> float:
     delta = series.diff()
@@ -96,10 +96,8 @@ def compute_macd(series: pd.Series):
 def compute_trend(series: pd.Series, days: int = 10) -> str:
     recent = series.tail(days)
     pct = (recent.iloc[-1] - recent.iloc[0]) / recent.iloc[0] * 100
-    if pct > 0.5:
-        return "Uptrend"
-    if pct < -0.5:
-        return "Downtrend"
+    if pct > 0.5: return "Uptrend"
+    if pct < -0.5: return "Downtrend"
     return "Sideways"
 
 
@@ -124,6 +122,8 @@ def score_to_signal(score: int) -> str:
     if score == -2: return "SELL"
     return "STRONG SELL"
 
+
+# ─── Main Analyzer ───────────────────────────────────────────────────────────
 
 def analyze_ticker(ticker: str) -> dict:
     df = fetch_daily(ticker)
@@ -153,53 +153,36 @@ def analyze_ticker(ticker: str) -> dict:
     last_vol = float(volume.iloc[-1])
     vol_ratio = round(last_vol / avg_vol, 2) if avg_vol > 0 else 1.0
 
-    score, reasons = 0, []
+    score = 0
+    reasons = []
 
     if price > s20 > s50:
-        score += 1; reasons.append("Price above SMA20 & SMA50 — bullish alignment")
+        score += 1; reasons.append("Bullish alignment (Price > SMA20 > SMA50)")
     elif price < s20 < s50:
-        score -= 1; reasons.append("Price below SMA20 & SMA50 — bearish alignment")
-    elif s20 > s50:
-        score += 1; reasons.append("Golden cross — bullish")
-    else:
-        score -= 1; reasons.append("Death cross — bearish")
+        score -= 1; reasons.append("Bearish alignment (Price < SMA20 < SMA50)")
 
     if rsi < 30:
-        score += 2; reasons.append(f"RSI {rsi} — oversold")
+        score += 2; reasons.append(f"RSI {rsi} — Oversold")
     elif rsi > 70:
-        score -= 2; reasons.append(f"RSI {rsi} — overbought")
+        score -= 2; reasons.append(f"RSI {rsi} — Overbought")
 
     if macd > macd_sig:
-        score += 1; reasons.append("MACD bullish")
+        score += 1; reasons.append("MACD Bullish")
     elif macd < macd_sig:
-        score -= 1; reasons.append("MACD bearish")
+        score -= 1; reasons.append("MACD Bearish")
 
-    if trend == "Uptrend":
-        score += 1
-    elif trend == "Downtrend":
-        score -= 1
+    if trend == "Uptrend": score += 1
+    if trend == "Downtrend": score -= 1
 
-    if price < bb["lower"]:
-        score += 1
-    elif price > bb["upper"]:
-        score -= 1
-
-    hist40     = [round(float(x), 2) for x in close.tail(40).tolist()]
-    sma20_hist = [round(float(x), 2) for x in sma20.tail(40).tolist()]
+    if price < bb["lower"]: score += 1
+    if price > bb["upper"]: score -= 1
 
     overview = fetch_overview(ticker)
-    name        = overview.get("companyName", ticker.upper())
-    sector      = overview.get("sector", "")
-    industry    = overview.get("industry", "")
-    market_cap  = overview.get("mktCap")
-    pe_ratio    = overview.get("pe")
-    week_range  = overview.get("range")
-
-    week52_low = week52_high = None
-    if week_range and "-" in week_range:
-        parts = week_range.split("-")
-        week52_low = float(parts[0])
-        week52_high = float(parts[1])
+    name = overview.get("companyName", ticker.upper())
+    sector = overview.get("sector", "")
+    industry = overview.get("industry", "")
+    market_cap = overview.get("mktCap")
+    pe_ratio = overview.get("pe")
 
     return {
         "ticker": ticker.upper(),
@@ -212,19 +195,13 @@ def analyze_ticker(ticker: str) -> dict:
         "sma50": s50,
         "rsi": rsi,
         "macd": macd,
-        "macdSignal": macd_sig,
-        "macdHist": macd_hist,
         "trend": trend,
         "bb": bb,
         "volRatio": vol_ratio,
         "marketCap": market_cap,
         "peRatio": pe_ratio,
-        "week52High": week52_high,
-        "week52Low": week52_low,
         "score": score,
         "signal": score_to_signal(score),
-        "priceHistory": hist40,
-        "smaHistory": sma20_hist,
         "reasons": reasons,
     }
 
@@ -235,18 +212,12 @@ def analyze_ticker(ticker: str) -> dict:
 def root():
     return {"status": "ok", "message": "ParmStockAdvisor API v2.0", "docs": "/docs"}
 
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
-
 @app.get("/analyze/{ticker}")
 def analyze(ticker: str):
     try:
         return analyze_ticker(ticker.upper().strip())
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/quote/{ticker}")
 def quick_quote(ticker: str):
