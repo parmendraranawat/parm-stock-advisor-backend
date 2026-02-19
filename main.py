@@ -1,6 +1,6 @@
 """
 ParmStockAdvisor — FastAPI Backend
-Fetches real-time data from Alpha Vantage API using pandas/numpy.
+Fetches real-time data from Financial Modeling Prep API using pandas/numpy.
 
 Run locally:
     pip install -r requirements.txt
@@ -9,20 +9,16 @@ Run locally:
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, List
 import pandas as pd
 import numpy as np
 import requests
-import time
 
-# ─── Alpha Vantage Config ─────────────────────────────────────────────────────
-AV_API_KEY = "VPSD9C69IC5OBOW7"
-AV_BASE    = "https://www.alphavantage.co/query"
+# ─── Financial Modeling Prep Config ──────────────────────────────────────────
+FMP_API_KEY = "BDUFyoYbfR6jCYehbHXlT53Y7D8PIfur"
+FMP_BASE    = "https://financialmodelingprep.com/api/v3"
 
 app = FastAPI(title="ParmStockAdvisor API", version="2.0.0")
 
-# Allow all origins so React Native (on any IP) can connect
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,58 +26,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Alpha Vantage Data Fetcher ───────────────────────────────────────────────
+# ─── Data Fetchers ───────────────────────────────────────────────────────────
 
 def fetch_daily(ticker: str) -> pd.DataFrame:
-    """Fetch daily OHLCV data from Alpha Vantage."""
-    params = {
-        "function":   "TIME_SERIES_DAILY",
-        "symbol":     ticker,
-        "outputsize": "compact",  # last 100 data points
-        "apikey":     AV_API_KEY,
-    }
-    r = requests.get(AV_BASE, params=params, timeout=15)
+    url = f"{FMP_BASE}/historical-price-full/{ticker}?timeseries=120&apikey={FMP_API_KEY}"
+    r = requests.get(url, timeout=15)
     data = r.json()
 
-    if "Time Series (Daily)" not in data:
-        msg = data.get("Note") or data.get("Information") or data.get("Error Message") or "No data"
-        raise ValueError(f"Alpha Vantage error for '{ticker}': {msg}")
+    if "historical" not in data:
+        raise ValueError(f"FMP error for '{ticker}': {data}")
 
-    ts = data["Time Series (Daily)"]
     rows = []
-    for date, vals in ts.items():
+    for item in data["historical"]:
         rows.append({
-            "Date":   pd.to_datetime(date),
-            "Open":   float(vals["1. open"]),
-            "High":   float(vals["2. high"]),
-            "Low":    float(vals["3. low"]),
-            "Close":  float(vals["4. close"]),
-            "Volume": float(vals["5. volume"]),
+            "Date":   pd.to_datetime(item["date"]),
+            "Open":   float(item["open"]),
+            "High":   float(item["high"]),
+            "Low":    float(item["low"]),
+            "Close":  float(item["close"]),
+            "Volume": float(item["volume"]),
         })
+
     df = pd.DataFrame(rows).sort_values("Date").reset_index(drop=True)
     return df
 
+
 def fetch_quote(ticker: str) -> dict:
-    """Fetch current quote from Alpha Vantage."""
-    params = {
-        "function": "GLOBAL_QUOTE",
-        "symbol":   ticker,
-        "apikey":   AV_API_KEY,
-    }
-    r = requests.get(AV_BASE, params=params, timeout=15)
+    url = f"{FMP_BASE}/quote/{ticker}?apikey={FMP_API_KEY}"
+    r = requests.get(url, timeout=15)
     data = r.json()
-    quote = data.get("Global Quote", {})
-    return quote
+    if not data:
+        return {}
+    return data[0]
+
 
 def fetch_overview(ticker: str) -> dict:
-    """Fetch company overview from Alpha Vantage."""
-    params = {
-        "function": "OVERVIEW",
-        "symbol":   ticker,
-        "apikey":   AV_API_KEY,
-    }
-    r = requests.get(AV_BASE, params=params, timeout=15)
-    return r.json()
+    url = f"{FMP_BASE}/profile/{ticker}?apikey={FMP_API_KEY}"
+    r = requests.get(url, timeout=15)
+    data = r.json()
+    if not data:
+        return {}
+    return data[0]
+
 
 # ─── Technical Analysis ───────────────────────────────────────────────────────
 
@@ -92,6 +78,7 @@ def compute_rsi(series: pd.Series, period: int = 14) -> float:
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
     return round(float(rsi.iloc[-1]), 2)
+
 
 def compute_macd(series: pd.Series):
     ema12 = series.ewm(span=12, adjust=False).mean()
@@ -105,12 +92,16 @@ def compute_macd(series: pd.Series):
         round(float(hist.iloc[-1]), 4),
     )
 
+
 def compute_trend(series: pd.Series, days: int = 10) -> str:
     recent = series.tail(days)
     pct = (recent.iloc[-1] - recent.iloc[0]) / recent.iloc[0] * 100
-    if pct > 0.5:  return "Uptrend"
-    if pct < -0.5: return "Downtrend"
+    if pct > 0.5:
+        return "Uptrend"
+    if pct < -0.5:
+        return "Downtrend"
     return "Sideways"
+
 
 def compute_bollinger(series: pd.Series, period: int = 20):
     sma = series.rolling(period).mean()
@@ -123,19 +114,21 @@ def compute_bollinger(series: pd.Series, period: int = 20):
         "lower":  round(float(lower.iloc[-1]), 2),
     }
 
+
 def score_to_signal(score: int) -> str:
-    if score >= 3:  return "STRONG BUY"
-    if score == 2:  return "BUY"
-    if score == 1:  return "WEAK BUY"
-    if score == 0:  return "HOLD"
+    if score >= 3: return "STRONG BUY"
+    if score == 2: return "BUY"
+    if score == 1: return "WEAK BUY"
+    if score == 0: return "HOLD"
     if score == -1: return "WEAK SELL"
     if score == -2: return "SELL"
     return "STRONG SELL"
 
+
 def analyze_ticker(ticker: str) -> dict:
     df = fetch_daily(ticker)
 
-    if df is None or df.empty:
+    if df.empty:
         raise ValueError(f"No data found for '{ticker}'")
 
     close  = df["Close"]
@@ -147,104 +140,92 @@ def analyze_ticker(ticker: str) -> dict:
     price = round(float(close.iloc[-1]), 2)
     prev  = round(float(close.iloc[-2]), 2)
     chg   = round((price - prev) / prev * 100, 2)
-    s20   = round(float(sma20.iloc[-1]), 2)
-    s50   = round(float(sma50.iloc[-1]), 2) if not pd.isna(sma50.iloc[-1]) else s20
 
-    rsi                      = compute_rsi(close)
+    s20 = round(float(sma20.iloc[-1]), 2)
+    s50 = round(float(sma50.iloc[-1]), 2) if not pd.isna(sma50.iloc[-1]) else s20
+
+    rsi = compute_rsi(close)
     macd, macd_sig, macd_hist = compute_macd(close)
-    trend                    = compute_trend(close)
-    bb                       = compute_bollinger(close)
+    trend = compute_trend(close)
+    bb = compute_bollinger(close)
 
-    avg_vol   = float(volume.tail(20).mean())
-    last_vol  = float(volume.iloc[-1])
+    avg_vol = float(volume.tail(20).mean())
+    last_vol = float(volume.iloc[-1])
     vol_ratio = round(last_vol / avg_vol, 2) if avg_vol > 0 else 1.0
 
-    # ── Scoring ──────────────────────────────────────────────────────────────
     score, reasons = 0, []
 
     if price > s20 > s50:
-        score += 1; reasons.append("Price above SMA20 & SMA50 — bullish alignment ✅")
+        score += 1; reasons.append("Price above SMA20 & SMA50 — bullish alignment")
     elif price < s20 < s50:
-        score -= 1; reasons.append("Price below SMA20 & SMA50 — bearish alignment ❌")
+        score -= 1; reasons.append("Price below SMA20 & SMA50 — bearish alignment")
     elif s20 > s50:
-        score += 1; reasons.append("Golden cross (SMA20 > SMA50) — bullish ✅")
+        score += 1; reasons.append("Golden cross — bullish")
     else:
-        score -= 1; reasons.append("Death cross (SMA20 < SMA50) — bearish ❌")
+        score -= 1; reasons.append("Death cross — bearish")
 
     if rsi < 30:
-        score += 2; reasons.append(f"RSI {rsi} — oversold, strong buy signal 🟢🟢")
-    elif rsi < 40:
-        score += 1; reasons.append(f"RSI {rsi} — approaching oversold territory 🟢")
+        score += 2; reasons.append(f"RSI {rsi} — oversold")
     elif rsi > 70:
-        score -= 2; reasons.append(f"RSI {rsi} — overbought, consider selling 🔴🔴")
-    elif rsi > 60:
-        score -= 1; reasons.append(f"RSI {rsi} — approaching overbought 🔴")
-    else:
-        reasons.append(f"RSI {rsi} — neutral zone (40–60) ⚪")
+        score -= 2; reasons.append(f"RSI {rsi} — overbought")
 
-    if macd > macd_sig and macd_hist > 0:
-        score += 1; reasons.append("MACD above signal line — bullish momentum ✅")
-    elif macd < macd_sig and macd_hist < 0:
-        score -= 1; reasons.append("MACD below signal line — bearish momentum ❌")
-    else:
-        reasons.append("MACD crossing signal — watch for confirmation ⚠️")
+    if macd > macd_sig:
+        score += 1; reasons.append("MACD bullish")
+    elif macd < macd_sig:
+        score -= 1; reasons.append("MACD bearish")
 
     if trend == "Uptrend":
-        score += 1; reasons.append("10-day price trend is upward ✅")
+        score += 1
     elif trend == "Downtrend":
-        score -= 1; reasons.append("10-day price trend is downward ❌")
-    else:
-        reasons.append("Price moving sideways — wait for breakout ⚪")
+        score -= 1
 
     if price < bb["lower"]:
-        score += 1; reasons.append(f"Price below Bollinger lower band (${bb['lower']}) — potential bounce ✅")
+        score += 1
     elif price > bb["upper"]:
-        score -= 1; reasons.append(f"Price above Bollinger upper band (${bb['upper']}) — potential reversal ❌")
+        score -= 1
 
-    # Chart data (last 40 days)
     hist40     = [round(float(x), 2) for x in close.tail(40).tolist()]
     sma20_hist = [round(float(x), 2) for x in sma20.tail(40).tolist()]
 
-    # Company info
-    try:
-        overview = fetch_overview(ticker)
-        name       = overview.get("Name", ticker.upper())
-        sector     = overview.get("Sector", "")
-        industry   = overview.get("Industry", "")
-        market_cap = float(overview["MarketCapitalization"]) if overview.get("MarketCapitalization") else None
-        pe_ratio   = float(overview["PERatio"]) if overview.get("PERatio") and overview["PERatio"] != "None" else None
-        week52_high = float(overview["52WeekHigh"]) if overview.get("52WeekHigh") else None
-        week52_low  = float(overview["52WeekLow"]) if overview.get("52WeekLow") else None
-    except Exception:
-        name = ticker.upper()
-        sector = industry = ""
-        market_cap = pe_ratio = week52_high = week52_low = None
+    overview = fetch_overview(ticker)
+    name        = overview.get("companyName", ticker.upper())
+    sector      = overview.get("sector", "")
+    industry    = overview.get("industry", "")
+    market_cap  = overview.get("mktCap")
+    pe_ratio    = overview.get("pe")
+    week_range  = overview.get("range")
+
+    week52_low = week52_high = None
+    if week_range and "-" in week_range:
+        parts = week_range.split("-")
+        week52_low = float(parts[0])
+        week52_high = float(parts[1])
 
     return {
-        "ticker":       ticker.upper(),
-        "companyName":  name,
-        "sector":       sector,
-        "industry":     industry,
-        "price":        price,
-        "changePct":    chg,
-        "sma20":        s20,
-        "sma50":        s50,
-        "rsi":          rsi,
-        "macd":         macd,
-        "macdSignal":   macd_sig,
-        "macdHist":     macd_hist,
-        "trend":        trend,
-        "bb":           bb,
-        "volRatio":     vol_ratio,
-        "marketCap":    market_cap,
-        "peRatio":      round(pe_ratio, 2) if pe_ratio else None,
-        "week52High":   round(week52_high, 2) if week52_high else None,
-        "week52Low":    round(week52_low, 2) if week52_low else None,
-        "score":        score,
-        "signal":       score_to_signal(score),
+        "ticker": ticker.upper(),
+        "companyName": name,
+        "sector": sector,
+        "industry": industry,
+        "price": price,
+        "changePct": chg,
+        "sma20": s20,
+        "sma50": s50,
+        "rsi": rsi,
+        "macd": macd,
+        "macdSignal": macd_sig,
+        "macdHist": macd_hist,
+        "trend": trend,
+        "bb": bb,
+        "volRatio": vol_ratio,
+        "marketCap": market_cap,
+        "peRatio": pe_ratio,
+        "week52High": week52_high,
+        "week52Low": week52_low,
+        "score": score,
+        "signal": score_to_signal(score),
         "priceHistory": hist40,
-        "smaHistory":   sma20_hist,
-        "reasons":      reasons,
+        "smaHistory": sma20_hist,
+        "reasons": reasons,
     }
 
 
@@ -260,57 +241,27 @@ def health():
 
 @app.get("/analyze/{ticker}")
 def analyze(ticker: str):
-    """Analyze a single stock ticker."""
     try:
-        data = analyze_ticker(ticker.upper().strip())
-        return data
+        return analyze_ticker(ticker.upper().strip())
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
-@app.get("/analyze-many")
-def analyze_many(tickers: str):
-    """
-    Analyze multiple tickers at once.
-    Usage: /analyze-many?tickers=AAPL,MSFT,TSLA
-    """
-    ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
-    results = []
-    errors  = []
-    for t in ticker_list[:20]:
-        try:
-            results.append(analyze_ticker(t))
-            time.sleep(0.5)  # respect Alpha Vantage rate limit
-        except Exception as e:
-            errors.append({"ticker": t, "error": str(e)})
-    return {"results": results, "errors": errors}
-
-@app.get("/sectors")
-def get_sectors():
-    """Return all predefined sector watchlists."""
-    return {
-        "Technology":  ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "AMD", "INTC", "ORCL"],
-        "Finance":     ["JPM", "BAC", "GS", "MS", "WFC", "C", "AXP", "BLK", "V"],
-        "Healthcare":  ["JNJ", "PFE", "ABBV", "MRK", "UNH", "LLY", "TMO", "ABT", "BMY", "AMGN"],
-        "Energy":      ["XOM", "CVX", "COP", "EOG", "SLB", "OXY", "MPC", "PSX", "VLO", "HAL"],
-        "Consumer":    ["WMT", "COST", "TGT", "MCD", "SBUX", "NKE", "HD", "LOW", "TJX"],
-        "Crypto ETF":  ["IBIT", "FBTC", "GBTC", "ETHA", "BITB", "ARKB"],
-    }
-
 @app.get("/quote/{ticker}")
 def quick_quote(ticker: str):
-    """Fast price-only quote."""
     try:
         quote = fetch_quote(ticker.upper())
-        if not quote or "05. price" not in quote:
+        if not quote or "price" not in quote:
             raise ValueError("No quote data")
-        price = float(quote["05. price"])
-        prev  = float(quote["08. previous close"])
+
+        price = float(quote["price"])
+        prev  = float(quote["previousClose"])
+
         return {
-            "ticker":    ticker.upper(),
-            "price":     round(price, 2),
-            "change":    round(price - prev, 2),
+            "ticker": ticker.upper(),
+            "price": round(price, 2),
+            "change": round(price - prev, 2),
             "changePct": round((price - prev) / prev * 100, 2),
         }
     except Exception as e:
