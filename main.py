@@ -1,7 +1,8 @@
 """
 ParmStockAdvisor — FastAPI Backend
 Fetches real-time data from Financial Modeling Prep (FMP) — Stable API.
-Free plan: 250 req/day — US exchanges only (NYSE, NASDAQ, AMEX).
+Two free keys rotated automatically = 500 req/day.
+15-minute cache prevents unnecessary API calls.
 
 Run locally:
     pip install -r requirements.txt
@@ -16,13 +17,27 @@ import requests
 import time
 from datetime import datetime, timedelta
 
-# ─── FMP Config ───────────────────────────────────────────────────────────────
+# ─── FMP Key Rotation ─────────────────────────────────────────────────────────
+# Two free accounts = 500 req/day total.
+# On 429 error, automatically switches to the next key.
 
-FMP_API_KEY = "BDUFyoYbfR6jCYehbHXlT53Y7D8PIfur"
+FMP_KEYS = [
+    "BDUFyoYbfR6jCYehbHXlT53Y7D8PIfur",   # Key 1
+    "XklYG6GICnaUcpoe3SGihtG1fLXCiqED",   # Key 2
+]
+FMP_BASE    = "https://financialmodelingprep.com/stable"
+_key_index  = 0
 
-# ─── In-memory cache ──────────────────────────────────────────────────────────
-# Caches full analysis results per ticker for 15 minutes
-# This prevents burning the 250 req/day FMP free quota
+def get_active_key() -> str:
+    return FMP_KEYS[_key_index]
+
+def rotate_key():
+    global _key_index
+    _key_index = (_key_index + 1) % len(FMP_KEYS)
+
+# ─── In-memory Cache ──────────────────────────────────────────────────────────
+# 15-minute cache per ticker — avoids burning quota on repeated requests.
+
 CACHE_TTL_MINUTES = 15
 _cache: dict = {}
 
@@ -37,9 +52,10 @@ def cache_set(ticker: str, data: dict):
         "data":    data,
         "expires": datetime.utcnow() + timedelta(minutes=CACHE_TTL_MINUTES),
     }
-FMP_BASE    = "https://financialmodelingprep.com/stable"
 
-app = FastAPI(title="ParmStockAdvisor API", version="5.2.0")
+# ─── App ──────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="ParmStockAdvisor API", version="6.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,16 +67,46 @@ app.add_middleware(
 # ─── FMP Helpers ──────────────────────────────────────────────────────────────
 
 def fmp_get(path: str, params: dict = {}) -> dict | list:
-    params = {**params, "apikey": FMP_API_KEY}
-    url = f"{FMP_BASE}/{path}"
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, dict) and "Error Message" in data:
-        raise ValueError(data["Error Message"])
-    if isinstance(data, dict) and "message" in data:
-        raise ValueError(f"FMP API error: {data['message']}")
-    return data
+    """
+    GET from FMP stable API with automatic key rotation on 429.
+    Tries all available keys before giving up.
+    """
+    global _key_index
+    last_error = None
+
+    for attempt in range(len(FMP_KEYS)):
+        key = get_active_key()
+        p   = {**params, "apikey": key}
+        url = f"{FMP_BASE}/{path}"
+        try:
+            r = requests.get(url, params=p, timeout=15)
+
+            if r.status_code == 429:
+                # Rate limited on this key — rotate and try next
+                rotate_key()
+                last_error = f"Key {attempt+1} rate limited (429)"
+                time.sleep(0.5)
+                continue
+
+            r.raise_for_status()
+            data = r.json()
+
+            if isinstance(data, dict) and "Error Message" in data:
+                raise ValueError(data["Error Message"])
+            if isinstance(data, dict) and "message" in data:
+                raise ValueError(f"FMP API error: {data['message']}")
+
+            return data
+
+        except requests.exceptions.HTTPError as e:
+            if r.status_code == 429:
+                rotate_key()
+                last_error = str(e)
+                time.sleep(0.5)
+                continue
+            raise
+
+    raise Exception(f"All API keys exhausted. Last error: {last_error}. Daily quota likely reached — resets at midnight UTC.")
 
 
 def get_historical_prices(ticker: str) -> pd.DataFrame:
@@ -74,19 +120,14 @@ def get_historical_prices(ticker: str) -> pd.DataFrame:
     df = pd.DataFrame(data)
     df.columns = [c.lower() for c in df.columns]
 
-    close_col = None
-    for candidate in ["close", "adjclose", "price"]:
-        if candidate in df.columns:
-            close_col = candidate
-            break
+    close_col = next((c for c in ["close", "adjclose", "price"] if c in df.columns), None)
     if close_col is None:
         raise ValueError(f"Cannot find close price column. Available: {list(df.columns)}")
 
     df.rename(columns={close_col: "Close"}, inplace=True)
     vol_col = next((c for c in ["volume", "vol"] if c in df.columns), None)
-    if vol_col:
-        df.rename(columns={vol_col: "Volume"}, inplace=True)
-    else:
+    df.rename(columns={vol_col: "Volume"}, inplace=True) if vol_col else None
+    if "Volume" not in df.columns:
         df["Volume"] = 0
 
     date_col = "date" if "date" in df.columns else df.columns[0]
@@ -116,11 +157,10 @@ def get_profile(ticker: str) -> dict:
 
 def compute_rsi(series: pd.Series, period: int = 14) -> float:
     delta = series.diff()
-    gain = delta.clip(lower=0).ewm(com=period - 1, min_periods=period).mean()
-    loss = (-delta.clip(upper=0)).ewm(com=period - 1, min_periods=period).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return round(float(rsi.iloc[-1]), 2)
+    gain  = delta.clip(lower=0).ewm(com=period - 1, min_periods=period).mean()
+    loss  = (-delta.clip(upper=0)).ewm(com=period - 1, min_periods=period).mean()
+    rs    = gain / loss
+    return round(float((100 - (100 / (1 + rs))).iloc[-1]), 2)
 
 
 def compute_macd(series: pd.Series):
@@ -138,7 +178,7 @@ def compute_macd(series: pd.Series):
 
 def compute_trend(series: pd.Series, days: int = 10) -> str:
     recent = series.tail(days)
-    pct = (recent.iloc[-1] - recent.iloc[0]) / recent.iloc[0] * 100
+    pct    = (recent.iloc[-1] - recent.iloc[0]) / recent.iloc[0] * 100
     if pct > 0.5:  return "Uptrend"
     if pct < -0.5: return "Downtrend"
     return "Sideways"
@@ -147,12 +187,10 @@ def compute_trend(series: pd.Series, days: int = 10) -> str:
 def compute_bollinger(series: pd.Series, period: int = 20):
     sma   = series.rolling(period).mean()
     std   = series.rolling(period).std()
-    upper = sma + 2 * std
-    lower = sma - 2 * std
     return {
-        "upper":  round(float(upper.iloc[-1]), 2),
-        "middle": round(float(sma.iloc[-1]),   2),
-        "lower":  round(float(lower.iloc[-1]), 2),
+        "upper":  round(float((sma + 2 * std).iloc[-1]), 2),
+        "middle": round(float(sma.iloc[-1]),              2),
+        "lower":  round(float((sma - 2 * std).iloc[-1]), 2),
     }
 
 
@@ -169,10 +207,10 @@ def score_to_signal(score: int) -> str:
 def analyze_ticker(ticker: str) -> dict:
     ticker = ticker.upper().strip()
 
-    # ── Return cached result if still fresh ──────────────────────────────────
+    # Return from cache if still fresh (saves API quota)
     cached = cache_get(ticker)
     if cached:
-        return cached
+        return {**cached, "cached": True}
 
     df     = get_historical_prices(ticker)
     close  = df["Close"]
@@ -191,22 +229,21 @@ def analyze_ticker(ticker: str) -> dict:
     macd, macd_sig, macd_hist = compute_macd(close)
     trend                     = compute_trend(close)
     bb                        = compute_bollinger(close)
-
-    avg_vol   = float(volume.tail(20).mean())
-    last_vol  = float(volume.iloc[-1])
-    vol_ratio = round(last_vol / avg_vol, 2) if avg_vol > 0 else 1.0
+    avg_vol                   = float(volume.tail(20).mean())
+    last_vol                  = float(volume.iloc[-1])
+    vol_ratio                 = round(last_vol / avg_vol, 2) if avg_vol > 0 else 1.0
 
     quote      = get_quote(ticker)
     live_price = float(quote.get("price", price))
     prev_close = float(quote.get("previousClose") or quote.get("open") or prev)
     live_chg   = round((live_price - prev_close) / prev_close * 100, 2) if prev_close else chg
 
-    profile    = get_profile(ticker)
-    name       = profile.get("companyName") or quote.get("name") or ticker
-    sector     = profile.get("sector", "")
-    industry   = profile.get("industry", "")
-    market_cap = quote.get("marketCap") or profile.get("mktCap") or None
-    pe_ratio   = quote.get("pe", None)
+    profile     = get_profile(ticker)
+    name        = profile.get("companyName") or quote.get("name") or ticker
+    sector      = profile.get("sector", "")
+    industry    = profile.get("industry", "")
+    market_cap  = quote.get("marketCap") or profile.get("mktCap") or None
+    pe_ratio    = quote.get("pe", None)
     week52_high = quote.get("yearHigh", None)
     week52_low  = quote.get("yearLow",  None)
 
@@ -251,9 +288,6 @@ def analyze_ticker(ticker: str) -> dict:
     elif price > bb["upper"]:
         score -= 1; reasons.append(f"Price above Bollinger upper band (${bb['upper']}) — potential reversal ❌")
 
-    hist40     = [round(float(x), 2) for x in close.tail(40).tolist()]
-    sma20_hist = [round(float(x), 2) for x in sma20.tail(40).tolist()]
-
     result = {
         "ticker":       ticker,
         "companyName":  name,
@@ -276,9 +310,10 @@ def analyze_ticker(ticker: str) -> dict:
         "week52Low":    round(float(week52_low),  2) if week52_low  else None,
         "score":        score,
         "signal":       score_to_signal(score),
-        "priceHistory": hist40,
-        "smaHistory":   sma20_hist,
+        "priceHistory": [round(float(x), 2) for x in close.tail(40).tolist()],
+        "smaHistory":   [round(float(x), 2) for x in sma20.tail(40).tolist()],
         "reasons":      reasons,
+        "cached":       False,
     }
 
     cache_set(ticker, result)
@@ -289,7 +324,12 @@ def analyze_ticker(ticker: str) -> dict:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "ParmStockAdvisor API v5.2 (FMP Stable)", "docs": "/docs"}
+    return {
+        "status":  "ok",
+        "message": "ParmStockAdvisor API v6.0 (Dual-key + Cache)",
+        "docs":    "/docs",
+        "active_key": f"Key {_key_index + 1} of {len(FMP_KEYS)}",
+    }
 
 @app.get("/health")
 def health():
@@ -297,22 +337,21 @@ def health():
 
 @app.get("/cache-status")
 def cache_status():
-    """Shows what's cached and when it expires — useful for debugging quota usage."""
     now = datetime.utcnow()
     return {
         "cached_tickers": len(_cache),
+        "active_key":     f"Key {_key_index + 1} of {len(FMP_KEYS)}",
         "entries": {
             ticker: {
-                "expires_in_seconds": max(0, int((entry["expires"] - now).total_seconds())),
-                "fresh": now < entry["expires"],
+                "expires_in_seconds": max(0, int((e["expires"] - now).total_seconds())),
+                "fresh": now < e["expires"],
             }
-            for ticker, entry in _cache.items()
-        }
+            for ticker, e in _cache.items()
+        },
     }
 
 @app.delete("/cache")
 def clear_cache():
-    """Clear all cached data — forces fresh API calls on next request."""
     _cache.clear()
     return {"status": "cache cleared"}
 
@@ -336,117 +375,85 @@ def analyze(ticker: str):
 
 @app.get("/analyze-many")
 def analyze_many(tickers: str):
+    """Usage: /analyze-many?tickers=AAPL,MSFT,TSLA"""
     ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     results, errors = [], []
     for t in ticker_list[:10]:
         try:
             results.append(analyze_ticker(t))
-            time.sleep(0.3)
+            time.sleep(0.2)
         except Exception as e:
             errors.append({"ticker": t, "error": str(e)})
     return {"results": results, "errors": errors}
 
 @app.get("/sectors")
 def get_sectors():
-    """
-    Comprehensive US stock watchlists — all confirmed free on FMP.
-    Only NYSE / NASDAQ / AMEX listed stocks (free plan coverage).
-    """
     return {
-        # ── Mega-cap Tech ──────────────────────────────────────────────────
         "Big Tech": [
             "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "META", "AMZN",
             "TSLA", "AMD", "INTC", "ORCL", "CRM", "ADBE", "QCOM",
             "TXN", "AVGO", "MU", "AMAT", "LRCX", "KLAC",
         ],
-
-        # ── Finance & Banking ──────────────────────────────────────────────
         "Finance": [
             "JPM", "BAC", "GS", "MS", "WFC", "C", "AXP", "BLK",
             "V", "MA", "PYPL", "COF", "USB", "PNC", "TFC",
             "SCHW", "BX", "KKR", "ICE", "CME",
         ],
-
-        # ── Healthcare & Pharma ────────────────────────────────────────────
         "Healthcare": [
             "JNJ", "PFE", "ABBV", "MRK", "UNH", "LLY", "TMO",
             "ABT", "BMY", "AMGN", "GILD", "ISRG", "CVS", "CI",
             "HUM", "BIIB", "REGN", "VRTX", "MRNA", "ZTS",
         ],
-
-        # ── Energy & Oil ───────────────────────────────────────────────────
         "Energy": [
             "XOM", "CVX", "COP", "EOG", "SLB", "OXY", "MPC",
-            "PSX", "VLO", "HAL", "DVN", "HES", "BKR", "FANG",
-            "MRO", "APA", "NOV", "RIG", "PXD", "WMB",
+            "PSX", "VLO", "HAL", "DVN", "HES", "BKR",
+            "MRO", "APA", "WMB",
         ],
-
-        # ── Consumer & Retail ──────────────────────────────────────────────
         "Consumer": [
             "WMT", "COST", "TGT", "MCD", "SBUX", "NKE", "HD",
-            "LOW", "TJX", "AMZN", "BABA", "PG", "KO", "PEP",
-            "PM", "MO", "EL", "CL", "KHC", "GIS",
+            "LOW", "TJX", "PG", "KO", "PEP",
+            "PM", "MO", "CL", "KHC", "GIS",
         ],
-
-        # ── ETFs ───────────────────────────────────────────────────────────
         "Top ETFs": [
             "SPY", "QQQ", "IWM", "DIA", "VTI", "VOO",
             "VGT", "XLK", "XLF", "XLE", "XLV", "XLI",
             "GLD", "SLV", "TLT", "HYG", "EEM", "VEA",
         ],
-
-        # ── Crypto ETFs ────────────────────────────────────────────────────
         "Crypto ETF": [
             "IBIT", "FBTC", "GBTC", "ETHA", "BITB", "ARKB",
             "HODL", "BTCO", "BRRR", "EZBC",
         ],
-
-        # ── Industrial & Defense ───────────────────────────────────────────
         "Industrial": [
             "BA", "CAT", "GE", "HON", "MMM", "RTX", "LMT",
-            "NOC", "GD", "DE", "EMR", "ETN", "PH", "ROK",
+            "NOC", "GD", "DE", "EMR", "ETN", "PH",
             "ITW", "FDX", "UPS", "CSX", "NSC", "UNP",
         ],
-
-        # ── Real Estate REITs ──────────────────────────────────────────────
         "REITs": [
             "AMT", "PLD", "CCI", "EQIX", "PSA", "O",
             "WELL", "DLR", "AVB", "EQR", "SPG", "VTR",
-            "SBAC", "ARE", "BXP", "KIM", "NNN", "WPC",
+            "SBAC", "ARE", "BXP", "KIM", "NNN",
         ],
-
-        # ── AI & Growth ────────────────────────────────────────────────────
         "AI & Growth": [
             "NVDA", "MSFT", "GOOGL", "META", "AMZN", "CRM",
-            "PLTR", "AI", "PATH", "SNOW", "DDOG", "NET",
-            "CFLT", "MDB", "GTLB", "ZS", "CRWD", "PANW",
-            "S", "BILL",
+            "PLTR", "PATH", "SNOW", "DDOG", "NET",
+            "MDB", "ZS", "CRWD", "PANW", "S",
         ],
-
-        # ── Dividend Kings ─────────────────────────────────────────────────
         "Dividends": [
             "JNJ", "KO", "PG", "MMM", "T", "VZ", "O",
             "ABBV", "XOM", "CVX", "IBM", "PEP", "MCD",
             "WMT", "HD", "LOW", "TGT", "COST", "UPS", "FDX",
         ],
-
-        # ── Indian ADRs on NYSE/NASDAQ ──────────────────────────────────────
         "India ADRs": [
-            "INFY",   # Infosys
-            "WIT",    # Wipro
-            "HDB",    # HDFC Bank
-            "IBN",    # ICICI Bank
-            "TTM",    # Tata Motors
-            "RDY",    # Dr. Reddy's Laboratories
-            "VEDL",   # Vedanta
-            "SIFY",   # Sify Technologies
-            "MTE",    # Mphasis (via ADR)
-            "REDF",   # Rediff.com
-            "YTRA",   # Yatra Online
-            "MTCL",   # Mastech Holdings
-            "AZRE",   # Azure Power (India solar)
-            "CLOV",   # listed but India-linked
-            "PGTI",   # PGT Innovations
+            "INFY",  # Infosys
+            "WIT",   # Wipro
+            "HDB",   # HDFC Bank
+            "IBN",   # ICICI Bank
+            "TTM",   # Tata Motors
+            "RDY",   # Dr. Reddy's
+            "VEDL",  # Vedanta
+            "AZRE",  # Azure Power
+            "SIFY",  # Sify Technologies
+            "YTRA",  # Yatra Online
         ],
     }
 
