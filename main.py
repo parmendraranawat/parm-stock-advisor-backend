@@ -1,7 +1,7 @@
 """
 ParmStockAdvisor — FastAPI Backend
 Fetches real-time data from Financial Modeling Prep (FMP) — Stable API.
-Free plan: 250 req/day.
+Free plan: 250 req/day — US exchanges only (NYSE, NASDAQ, AMEX).
 
 Run locally:
     pip install -r requirements.txt
@@ -20,7 +20,7 @@ import time
 FMP_API_KEY = "BDUFyoYbfR6jCYehbHXlT53Y7D8PIfur"
 FMP_BASE    = "https://financialmodelingprep.com/stable"
 
-app = FastAPI(title="ParmStockAdvisor API", version="5.1.0")
+app = FastAPI(title="ParmStockAdvisor API", version="5.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,44 +49,30 @@ def get_historical_prices(ticker: str) -> pd.DataFrame:
         "symbol": ticker,
         "limit":  130,
     })
-
     if not data or not isinstance(data, list):
-        raise ValueError(f"No historical data found for '{ticker}' — raw response: {data}")
+        raise ValueError(f"No historical data found for '{ticker}'")
 
     df = pd.DataFrame(data)
+    df.columns = [c.lower() for c in df.columns]
 
-    # ── Normalise column names ────────────────────────────────────────────────
-    # FMP may return: 'close', 'Close', 'adjClose', 'price' — handle all cases
-    df.columns = [c.lower() for c in df.columns]   # lowercase everything first
-
-    # Find the close price column
     close_col = None
-    for candidate in ["close", "adjclose", "price", "adjclose"]:
+    for candidate in ["close", "adjclose", "price"]:
         if candidate in df.columns:
             close_col = candidate
             break
-
     if close_col is None:
-        raise ValueError(f"Cannot find close price column. Available columns: {list(df.columns)}")
+        raise ValueError(f"Cannot find close price column. Available: {list(df.columns)}")
 
     df.rename(columns={close_col: "Close"}, inplace=True)
-
-    # Find volume column
-    vol_col = None
-    for candidate in ["volume", "vol"]:
-        if candidate in df.columns:
-            vol_col = candidate
-            break
+    vol_col = next((c for c in ["volume", "vol"] if c in df.columns), None)
     if vol_col:
         df.rename(columns={vol_col: "Volume"}, inplace=True)
     else:
         df["Volume"] = 0
 
-    # Parse date
     date_col = "date" if "date" in df.columns else df.columns[0]
     df[date_col] = pd.to_datetime(df[date_col])
     df = df.sort_values(date_col).reset_index(drop=True)
-
     return df
 
 
@@ -276,16 +262,14 @@ def analyze_ticker(ticker: str) -> dict:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "ParmStockAdvisor API v5.1 (FMP Stable)", "docs": "/docs"}
+    return {"status": "ok", "message": "ParmStockAdvisor API v5.2 (FMP Stable)", "docs": "/docs"}
 
 @app.get("/health")
 def health():
     return {"status": "healthy"}
 
-# ── DEBUG endpoint — use this to see raw FMP response if something breaks ──
 @app.get("/debug/{ticker}")
 def debug(ticker: str):
-    """Returns the raw FMP response so we can see exact column names."""
     raw_hist  = fmp_get("historical-price-eod/light", {"symbol": ticker.upper(), "limit": 3})
     raw_quote = fmp_get("quote", {"symbol": ticker.upper()})
     return {
@@ -304,7 +288,6 @@ def analyze(ticker: str):
 
 @app.get("/analyze-many")
 def analyze_many(tickers: str):
-    """Usage: /analyze-many?tickers=AAPL,MSFT,TSLA"""
     ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     results, errors = [], []
     for t in ticker_list[:10]:
@@ -317,13 +300,106 @@ def analyze_many(tickers: str):
 
 @app.get("/sectors")
 def get_sectors():
+    """
+    Comprehensive US stock watchlists — all confirmed free on FMP.
+    Only NYSE / NASDAQ / AMEX listed stocks (free plan coverage).
+    """
     return {
-        "Technology":  ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "AMD", "INTC", "ORCL"],
-        "Finance":     ["JPM", "BAC", "GS", "MS", "WFC", "BRK-B", "C", "AXP", "BLK", "V"],
-        "Healthcare":  ["JNJ", "PFE", "ABBV", "MRK", "UNH", "LLY", "TMO", "ABT", "BMY", "AMGN"],
-        "Energy":      ["XOM", "CVX", "COP", "EOG", "SLB", "OXY", "MPC", "PSX", "VLO", "HAL"],
-        "Consumer":    ["WMT", "COST", "TGT", "MCD", "SBUX", "NKE", "HD", "LOW", "TJX"],
-        "Crypto ETF":  ["IBIT", "FBTC", "GBTC", "ETHA", "BITB", "ARKB"],
+        # ── Mega-cap Tech ──────────────────────────────────────────────────
+        "Big Tech": [
+            "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "META", "AMZN",
+            "TSLA", "AMD", "INTC", "ORCL", "CRM", "ADBE", "QCOM",
+            "TXN", "AVGO", "MU", "AMAT", "LRCX", "KLAC",
+        ],
+
+        # ── Finance & Banking ──────────────────────────────────────────────
+        "Finance": [
+            "JPM", "BAC", "GS", "MS", "WFC", "C", "AXP", "BLK",
+            "V", "MA", "PYPL", "COF", "USB", "PNC", "TFC",
+            "SCHW", "BX", "KKR", "ICE", "CME",
+        ],
+
+        # ── Healthcare & Pharma ────────────────────────────────────────────
+        "Healthcare": [
+            "JNJ", "PFE", "ABBV", "MRK", "UNH", "LLY", "TMO",
+            "ABT", "BMY", "AMGN", "GILD", "ISRG", "CVS", "CI",
+            "HUM", "BIIB", "REGN", "VRTX", "MRNA", "ZTS",
+        ],
+
+        # ── Energy & Oil ───────────────────────────────────────────────────
+        "Energy": [
+            "XOM", "CVX", "COP", "EOG", "SLB", "OXY", "MPC",
+            "PSX", "VLO", "HAL", "DVN", "HES", "BKR", "FANG",
+            "MRO", "APA", "NOV", "RIG", "PXD", "WMB",
+        ],
+
+        # ── Consumer & Retail ──────────────────────────────────────────────
+        "Consumer": [
+            "WMT", "COST", "TGT", "MCD", "SBUX", "NKE", "HD",
+            "LOW", "TJX", "AMZN", "BABA", "PG", "KO", "PEP",
+            "PM", "MO", "EL", "CL", "KHC", "GIS",
+        ],
+
+        # ── ETFs ───────────────────────────────────────────────────────────
+        "Top ETFs": [
+            "SPY", "QQQ", "IWM", "DIA", "VTI", "VOO",
+            "VGT", "XLK", "XLF", "XLE", "XLV", "XLI",
+            "GLD", "SLV", "TLT", "HYG", "EEM", "VEA",
+        ],
+
+        # ── Crypto ETFs ────────────────────────────────────────────────────
+        "Crypto ETF": [
+            "IBIT", "FBTC", "GBTC", "ETHA", "BITB", "ARKB",
+            "HODL", "BTCO", "BRRR", "EZBC",
+        ],
+
+        # ── Industrial & Defense ───────────────────────────────────────────
+        "Industrial": [
+            "BA", "CAT", "GE", "HON", "MMM", "RTX", "LMT",
+            "NOC", "GD", "DE", "EMR", "ETN", "PH", "ROK",
+            "ITW", "FDX", "UPS", "CSX", "NSC", "UNP",
+        ],
+
+        # ── Real Estate REITs ──────────────────────────────────────────────
+        "REITs": [
+            "AMT", "PLD", "CCI", "EQIX", "PSA", "O",
+            "WELL", "DLR", "AVB", "EQR", "SPG", "VTR",
+            "SBAC", "ARE", "BXP", "KIM", "NNN", "WPC",
+        ],
+
+        # ── AI & Growth ────────────────────────────────────────────────────
+        "AI & Growth": [
+            "NVDA", "MSFT", "GOOGL", "META", "AMZN", "CRM",
+            "PLTR", "AI", "PATH", "SNOW", "DDOG", "NET",
+            "CFLT", "MDB", "GTLB", "ZS", "CRWD", "PANW",
+            "S", "BILL",
+        ],
+
+        # ── Dividend Kings ─────────────────────────────────────────────────
+        "Dividends": [
+            "JNJ", "KO", "PG", "MMM", "T", "VZ", "O",
+            "ABBV", "XOM", "CVX", "IBM", "PEP", "MCD",
+            "WMT", "HD", "LOW", "TGT", "COST", "UPS", "FDX",
+        ],
+
+        # ── Indian ADRs on NYSE/NASDAQ ──────────────────────────────────────
+        "India ADRs": [
+            "INFY",   # Infosys
+            "WIT",    # Wipro
+            "HDB",    # HDFC Bank
+            "IBN",    # ICICI Bank
+            "TTM",    # Tata Motors
+            "RDY",    # Dr. Reddy's Laboratories
+            "VEDL",   # Vedanta
+            "SIFY",   # Sify Technologies
+            "MTE",    # Mphasis (via ADR)
+            "REDF",   # Rediff.com
+            "YTRA",   # Yatra Online
+            "MTCL",   # Mastech Holdings
+            "AZRE",   # Azure Power (India solar)
+            "CLOV",   # listed but India-linked
+            "PGTI",   # PGT Innovations
+        ],
     }
 
 @app.get("/quote/{ticker}")
