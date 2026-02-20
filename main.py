@@ -14,10 +14,29 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+from datetime import datetime, timedelta
 
 # ─── FMP Config ───────────────────────────────────────────────────────────────
 
 FMP_API_KEY = "BDUFyoYbfR6jCYehbHXlT53Y7D8PIfur"
+
+# ─── In-memory cache ──────────────────────────────────────────────────────────
+# Caches full analysis results per ticker for 15 minutes
+# This prevents burning the 250 req/day FMP free quota
+CACHE_TTL_MINUTES = 15
+_cache: dict = {}
+
+def cache_get(ticker: str):
+    entry = _cache.get(ticker)
+    if entry and datetime.utcnow() < entry["expires"]:
+        return entry["data"]
+    return None
+
+def cache_set(ticker: str, data: dict):
+    _cache[ticker] = {
+        "data":    data,
+        "expires": datetime.utcnow() + timedelta(minutes=CACHE_TTL_MINUTES),
+    }
 FMP_BASE    = "https://financialmodelingprep.com/stable"
 
 app = FastAPI(title="ParmStockAdvisor API", version="5.2.0")
@@ -150,6 +169,11 @@ def score_to_signal(score: int) -> str:
 def analyze_ticker(ticker: str) -> dict:
     ticker = ticker.upper().strip()
 
+    # ── Return cached result if still fresh ──────────────────────────────────
+    cached = cache_get(ticker)
+    if cached:
+        return cached
+
     df     = get_historical_prices(ticker)
     close  = df["Close"]
     volume = df["Volume"]
@@ -230,7 +254,7 @@ def analyze_ticker(ticker: str) -> dict:
     hist40     = [round(float(x), 2) for x in close.tail(40).tolist()]
     sma20_hist = [round(float(x), 2) for x in sma20.tail(40).tolist()]
 
-    return {
+    result = {
         "ticker":       ticker,
         "companyName":  name,
         "sector":       sector,
@@ -257,6 +281,9 @@ def analyze_ticker(ticker: str) -> dict:
         "reasons":      reasons,
     }
 
+    cache_set(ticker, result)
+    return result
+
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
@@ -267,6 +294,27 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "healthy"}
+
+@app.get("/cache-status")
+def cache_status():
+    """Shows what's cached and when it expires — useful for debugging quota usage."""
+    now = datetime.utcnow()
+    return {
+        "cached_tickers": len(_cache),
+        "entries": {
+            ticker: {
+                "expires_in_seconds": max(0, int((entry["expires"] - now).total_seconds())),
+                "fresh": now < entry["expires"],
+            }
+            for ticker, entry in _cache.items()
+        }
+    }
+
+@app.delete("/cache")
+def clear_cache():
+    """Clear all cached data — forces fresh API calls on next request."""
+    _cache.clear()
+    return {"status": "cache cleared"}
 
 @app.get("/debug/{ticker}")
 def debug(ticker: str):
