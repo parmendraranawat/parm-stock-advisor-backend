@@ -3,11 +3,6 @@ ParmStockAdvisor — FastAPI Backend
 Fetches real-time data from Financial Modeling Prep (FMP) — Stable API.
 Free plan: 250 req/day.
 
-Correct stable endpoints used:
-  - Historical EOD: /stable/historical-price-eod/light?symbol=AAPL
-  - Quote:          /stable/quote?symbol=AAPL
-  - Profile:        /stable/profile?symbol=AAPL
-
 Run locally:
     pip install -r requirements.txt
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
@@ -25,7 +20,7 @@ import time
 FMP_API_KEY = "BDUFyoYbfR6jCYehbHXlT53Y7D8PIfur"
 FMP_BASE    = "https://financialmodelingprep.com/stable"
 
-app = FastAPI(title="ParmStockAdvisor API", version="5.0.0")
+app = FastAPI(title="ParmStockAdvisor API", version="5.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,7 +32,6 @@ app.add_middleware(
 # ─── FMP Helpers ──────────────────────────────────────────────────────────────
 
 def fmp_get(path: str, params: dict = {}) -> dict | list:
-    """GET from FMP stable API."""
     params = {**params, "apikey": FMP_API_KEY}
     url = f"{FMP_BASE}/{path}"
     r = requests.get(url, params=params, timeout=15)
@@ -46,37 +40,57 @@ def fmp_get(path: str, params: dict = {}) -> dict | list:
     if isinstance(data, dict) and "Error Message" in data:
         raise ValueError(data["Error Message"])
     if isinstance(data, dict) and "message" in data:
-        # FMP returns {"message": "..."} when plan doesn't cover the endpoint
         raise ValueError(f"FMP API error: {data['message']}")
     return data
 
 
 def get_historical_prices(ticker: str) -> pd.DataFrame:
-    """
-    Uses the FREE stable light EOD endpoint.
-    Returns last ~130 trading days with date, close, volume.
-    """
     data = fmp_get("historical-price-eod/light", {
         "symbol": ticker,
         "limit":  130,
     })
-    # Response is a list of {date, close, volume}
+
     if not data or not isinstance(data, list):
-        raise ValueError(f"No historical data found for '{ticker}'")
+        raise ValueError(f"No historical data found for '{ticker}' — raw response: {data}")
 
     df = pd.DataFrame(data)
-    df["date"]  = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
-    df.rename(columns={"close": "Close"}, inplace=True)
-    if "volume" in df.columns:
-        df.rename(columns={"volume": "Volume"}, inplace=True)
+
+    # ── Normalise column names ────────────────────────────────────────────────
+    # FMP may return: 'close', 'Close', 'adjClose', 'price' — handle all cases
+    df.columns = [c.lower() for c in df.columns]   # lowercase everything first
+
+    # Find the close price column
+    close_col = None
+    for candidate in ["close", "adjclose", "price", "adjclose"]:
+        if candidate in df.columns:
+            close_col = candidate
+            break
+
+    if close_col is None:
+        raise ValueError(f"Cannot find close price column. Available columns: {list(df.columns)}")
+
+    df.rename(columns={close_col: "Close"}, inplace=True)
+
+    # Find volume column
+    vol_col = None
+    for candidate in ["volume", "vol"]:
+        if candidate in df.columns:
+            vol_col = candidate
+            break
+    if vol_col:
+        df.rename(columns={vol_col: "Volume"}, inplace=True)
     else:
         df["Volume"] = 0
+
+    # Parse date
+    date_col = "date" if "date" in df.columns else df.columns[0]
+    df[date_col] = pd.to_datetime(df[date_col])
+    df = df.sort_values(date_col).reset_index(drop=True)
+
     return df
 
 
 def get_quote(ticker: str) -> dict:
-    """Live quote using stable endpoint."""
     data = fmp_get("quote", {"symbol": ticker})
     if not data or not isinstance(data, list) or len(data) == 0:
         raise ValueError(f"No quote found for '{ticker}'")
@@ -84,7 +98,6 @@ def get_quote(ticker: str) -> dict:
 
 
 def get_profile(ticker: str) -> dict:
-    """Company profile using stable endpoint."""
     try:
         data = fmp_get("profile", {"symbol": ticker})
         if data and isinstance(data, list):
@@ -151,7 +164,6 @@ def score_to_signal(score: int) -> str:
 def analyze_ticker(ticker: str) -> dict:
     ticker = ticker.upper().strip()
 
-    # 1. Historical prices (free EOD light endpoint)
     df     = get_historical_prices(ticker)
     close  = df["Close"]
     volume = df["Volume"]
@@ -174,13 +186,11 @@ def analyze_ticker(ticker: str) -> dict:
     last_vol  = float(volume.iloc[-1])
     vol_ratio = round(last_vol / avg_vol, 2) if avg_vol > 0 else 1.0
 
-    # 2. Live quote (free)
     quote      = get_quote(ticker)
     live_price = float(quote.get("price", price))
     prev_close = float(quote.get("previousClose") or quote.get("open") or prev)
     live_chg   = round((live_price - prev_close) / prev_close * 100, 2) if prev_close else chg
 
-    # 3. Company profile (free)
     profile    = get_profile(ticker)
     name       = profile.get("companyName") or quote.get("name") or ticker
     sector     = profile.get("sector", "")
@@ -190,7 +200,6 @@ def analyze_ticker(ticker: str) -> dict:
     week52_high = quote.get("yearHigh", None)
     week52_low  = quote.get("yearLow",  None)
 
-    # ── Scoring ───────────────────────────────────────────────────────────────
     score, reasons = 0, []
 
     if price > s20 > s50:
@@ -232,7 +241,6 @@ def analyze_ticker(ticker: str) -> dict:
     elif price > bb["upper"]:
         score -= 1; reasons.append(f"Price above Bollinger upper band (${bb['upper']}) — potential reversal ❌")
 
-    # Chart data (last 40 days)
     hist40     = [round(float(x), 2) for x in close.tail(40).tolist()]
     sma20_hist = [round(float(x), 2) for x in sma20.tail(40).tolist()]
 
@@ -268,15 +276,25 @@ def analyze_ticker(ticker: str) -> dict:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "ParmStockAdvisor API v5.0 (FMP Stable)", "docs": "/docs"}
+    return {"status": "ok", "message": "ParmStockAdvisor API v5.1 (FMP Stable)", "docs": "/docs"}
 
 @app.get("/health")
 def health():
     return {"status": "healthy"}
 
+# ── DEBUG endpoint — use this to see raw FMP response if something breaks ──
+@app.get("/debug/{ticker}")
+def debug(ticker: str):
+    """Returns the raw FMP response so we can see exact column names."""
+    raw_hist  = fmp_get("historical-price-eod/light", {"symbol": ticker.upper(), "limit": 3})
+    raw_quote = fmp_get("quote", {"symbol": ticker.upper()})
+    return {
+        "historical_sample": raw_hist[:3] if isinstance(raw_hist, list) else raw_hist,
+        "quote_sample":      raw_quote[0] if isinstance(raw_quote, list) and raw_quote else raw_quote,
+    }
+
 @app.get("/analyze/{ticker}")
 def analyze(ticker: str):
-    """Analyze a single stock ticker."""
     try:
         return analyze_ticker(ticker)
     except ValueError as e:
@@ -286,11 +304,7 @@ def analyze(ticker: str):
 
 @app.get("/analyze-many")
 def analyze_many(tickers: str):
-    """
-    Analyze multiple tickers.
-    Usage: /analyze-many?tickers=AAPL,MSFT,TSLA
-    Each ticker uses 3 FMP calls. Free plan = 250/day, so max ~80 tickers/day.
-    """
+    """Usage: /analyze-many?tickers=AAPL,MSFT,TSLA"""
     ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     results, errors = [], []
     for t in ticker_list[:10]:
@@ -314,13 +328,12 @@ def get_sectors():
 
 @app.get("/quote/{ticker}")
 def quick_quote(ticker: str):
-    """Fast price-only quote."""
     try:
-        q           = get_quote(ticker.upper().strip())
-        price       = float(q.get("price", 0))
-        prev_close  = float(q.get("previousClose") or q.get("open") or price)
-        chg         = round(price - prev_close, 2)
-        chg_pct     = round(chg / prev_close * 100, 2) if prev_close else 0.0
+        q          = get_quote(ticker.upper().strip())
+        price      = float(q.get("price", 0))
+        prev_close = float(q.get("previousClose") or q.get("open") or price)
+        chg        = round(price - prev_close, 2)
+        chg_pct    = round(chg / prev_close * 100, 2) if prev_close else 0.0
         return {
             "ticker":    ticker.upper(),
             "price":     round(price, 2),
